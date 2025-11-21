@@ -26,3 +26,13 @@ link_tool_log_*.txt
 .idea/
 .DS_Store
 Thumbs.db
+
+# Development files
+upload_package/
+v1.0.0/
+v1.1.0/
+*.exe
+clear_icon_cache.bat
+prepare_update_package.py
+duplicate_report.csv
+scripts/

@@ -1,4 +1,3 @@
-
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
@@ -48,6 +47,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
-        icon=[str(icon_path)],
-        version=str(version_info),
+    icon=str(icon_path),
+    version=str(version_info),
 )
