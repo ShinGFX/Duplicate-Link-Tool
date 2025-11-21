@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# PyInstaller build artifacts
+build/
+dist/
+dist_*/
+*.spec~
+update_package/
+
+# Logs and reports
+*.log
+*.tmp
+startup_debug.log
+link_tool_log_*.txt
+
+# IDE / editor
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
