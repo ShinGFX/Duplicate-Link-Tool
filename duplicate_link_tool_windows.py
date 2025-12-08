@@ -119,38 +119,21 @@ class HistoryEntry(tk.Entry):
         return 'break'
 
 
-def _log_startup(message: str) -> None:
-    """Record early-start events for troubleshooting elevation and packaging issues."""
-    try:
-        base = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
-        base.mkdir(parents=True, exist_ok=True)
-        with open(base / 'startup_debug.log', 'a', encoding='utf-8') as fp:
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            fp.write(f'[{timestamp}] {message}\n')
-    except Exception:
-        pass
-
 # ---- 管理者権限での自動再起動 ----
 def run_as_admin():
     if os.environ.get('DLTOOL_SKIP_ELEVATION') == '1':
-        _log_startup('Elevation skipped via DLTOOL_SKIP_ELEVATION')
         return True
     try:
         if ctypes.windll.shell32.IsUserAnAdmin():
-            _log_startup('Already running with administrative privileges')
             return True
 
         exe_path = Path(sys.executable).resolve()
         params = ' '.join(f'"{arg}"' for arg in (sys.argv[1:] if getattr(sys, 'frozen', False) else sys.argv))
-        _log_startup(f'Requesting elevation via ShellExecuteW: exe="{exe_path}" params="{params}"')
         result = ctypes.windll.shell32.ShellExecuteW(None, "runas", str(exe_path), params or None, None, 1)
-        _log_startup(f'ShellExecuteW returned {result}')
         if result <= 32:
-            _log_startup('Elevation request failed; terminating without relaunch')
             return False
         return None
-    except Exception as exc:
-        _log_startup(f'run_as_admin error: {exc!r}')
+    except Exception:
         return False
 
 
@@ -379,6 +362,23 @@ def find_duplicates(
     def worker(path: str):
         if cancel_flag.is_set():
             return None
+        
+        # リンク・ショートカットをスキップ（重複検出対象外）
+        path_obj = Path(path)
+        try:
+            # ショートカットの判定
+            if path_obj.suffix.lower() == '.lnk':
+                return None
+            # シンボリックリンク・ジャンクションの判定
+            if path_obj.is_symlink():
+                return None
+            # ハードリンクの判定（リンク数が2以上）
+            st = os.lstat(path)
+            if not path_obj.is_dir() and getattr(st, 'st_nlink', 1) > 1:
+                return None
+        except Exception:
+            pass
+        
         try:
             size = os.path.getsize(path)
         except Exception:
@@ -394,6 +394,20 @@ def find_duplicates(
                 return None
             if not os.path.exists(candidate):
                 continue
+            
+            # 候補側もリンク・ショートカットをスキップ
+            candidate_obj = Path(candidate)
+            try:
+                if candidate_obj.suffix.lower() == '.lnk':
+                    continue
+                if candidate_obj.is_symlink():
+                    continue
+                cand_st = os.lstat(candidate)
+                if not candidate_obj.is_dir() and getattr(cand_st, 'st_nlink', 1) > 1:
+                    continue
+            except Exception:
+                pass
+            
             # 同じフォルダ比較時：同一ファイルパス同士の比較はスキップ
             if is_same_folder and normalize(candidate) == path_normalized:
                 continue
@@ -414,6 +428,20 @@ def find_duplicates(
                 continue
             if candidate in primary_candidates:
                 continue
+            
+            # 候補側もリンク・ショートカットをスキップ
+            candidate_obj = Path(candidate)
+            try:
+                if candidate_obj.suffix.lower() == '.lnk':
+                    continue
+                if candidate_obj.is_symlink():
+                    continue
+                cand_st = os.lstat(candidate)
+                if not candidate_obj.is_dir() and getattr(cand_st, 'st_nlink', 1) > 1:
+                    continue
+            except Exception:
+                pass
+            
             # 同じフォルダ比較時：同一ファイルパス同士の比較はスキップ
             if is_same_folder and normalize(candidate) == path_normalized:
                 continue
@@ -529,11 +557,11 @@ def find_duplicates(
         )
         size_var.set(f'重複合計サイズ: {format_size(total_bytes)}')
         if open_compare_button is not None:
-            state = 'normal' if compare_non_duplicates else 'disabled'
-            open_compare_button.config(state=state)
+            relief = 'raised' if compare_non_duplicates else 'sunken'
+            open_compare_button.config(relief=relief)
         if open_main_button is not None:
-            state = 'normal' if main_non_duplicates else 'disabled'
-            open_main_button.config(state=state)
+            relief = 'raised' if main_non_duplicates else 'sunken'
+            open_main_button.config(relief=relief)
         if status_var is not None:
             status_var.set(f'ステータス: 重複検出完了 ({len(results)} 件)')
         if log_callback is not None:
@@ -569,11 +597,10 @@ def run_mklink(link_path: str, target_path: str, mode: str) -> tuple[bool, str]:
     # shell=Falseを使用してセキュリティを向上（OSコマンドインジェクション対策）
     if mode == 'hardlink':
         cmd = ['cmd', '/c', 'mklink', '/H', link_path, target_path]
-    elif mode == 'junction':
-        cmd = ['cmd', '/c', 'mklink', '/J', link_path, target_path]
     elif mode == 'symbolic_dir':
         cmd = ['cmd', '/c', 'mklink', '/D', link_path, target_path]
     else:
+        # symbolic_file（ファイルへのシンボリックリンク）
         cmd = ['cmd', '/c', 'mklink', link_path, target_path]
     try:
         res = subprocess.run(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=CREATE_NO_WINDOW)
@@ -641,12 +668,6 @@ def create_link(target_path: Path, link_path: Path, link_type: str, use_relative
             if target.is_dir():
                 return False, 'hardlink_requires_file', None
             os.link(str(target), str(link_actual))
-        elif link_type == 'ジャンクション':
-            if not target.is_dir():
-                return False, 'junction_requires_directory', None
-            ok, msg = run_mklink(str(link_actual), str(target), mode='junction')
-            if not ok:
-                return False, msg, None
         elif link_type == 'シンボリックリンク':
             mode = 'symbolic_dir' if target.is_dir() else 'symbolic_file'
             ok, msg = run_mklink(str(link_actual), str(target_for_link), mode=mode)
@@ -666,34 +687,27 @@ def create_link(target_path: Path, link_path: Path, link_type: str, use_relative
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('Duplicate Link Tool')
-        root.geometry('1000x850')
-        root.minsize(950, 720)
-        root.configure(bg=DARK_BG)
-        try:
-            icon_path = _resource_path(ASSET_ICON_NAME)
-            if icon_path.exists():
-                # iconbitmapでウィンドウアイコンを設定
-                root.iconbitmap(default=str(icon_path))
-                # wm_iconbitmapでタスクバーアイコンも明示的に設定
-                root.wm_iconbitmap(str(icon_path))
-        except Exception:
-            pass
+        self.root.withdraw()  # 初期化完了まで非表示
+        self._init_variables()
+        self._setup_window()
+        self._setup_styles()
+        self._create_widgets()
+        self._bind_events()
+        
+        # 初期状態で無効化設定を適用
+        self._on_link_type_changed()
+        self._adjust_initial_geometry()
+        self.root.deiconify()  # 初期化完了後に表示
+        self.root.after(200, self._ensure_front)
 
-        style = ttk.Style()
-        style.theme_use('default')
-        style.configure('Treeview', background=DARK_BG, foreground=DARK_FG, fieldbackground=DARK_BG)
-        style.configure('TButton', background=ACCENT, foreground=DARK_FG)
-        style.configure('Horizontal.TProgressbar', troughcolor='#333333', background=ACCENT)
-        style.map('Treeview', background=[('selected', '#2f4f6f')], foreground=[('selected', '#ffffff')])
-
+    def _init_variables(self):
         self.main_dir = tk.StringVar()
         self.compare_dir = tk.StringVar()
         self.realize_source = tk.StringVar()
-        self.link_type = tk.StringVar(value='ショートカット')  # デフォルトをショートカットに変更
-        self.link_name_mode = tk.StringVar(value='keep_main')  # デフォルトをα側に変更
-        self.link_path_mode = tk.StringVar(value='relative')  # デフォルトを相対パスに変更
-        self.keep_side = tk.StringVar(value='main')  # 'main' or 'compare' - どちらを残すか
+        self.link_type = tk.StringVar(value='ショートカット')
+        self.link_name_mode = tk.StringVar(value='keep_main')
+        self.link_path_mode = tk.StringVar(value='relative')
+        self.keep_side = tk.StringVar(value='main')
         self.use_same_as_main = tk.BooleanVar(value=False)
         self.cancel_flag = threading.Event()
         self.compare_non_duplicates = []
@@ -701,185 +715,256 @@ class App:
         self.main_link_summary_var = tk.StringVar(value='リンク状況: 未選択')
         self.compare_link_summary_var = tk.StringVar(value='リンク状況: 未選択')
         self.realize_link_summary_var = tk.StringVar(value='リンク状況: 未選択')
+        self.total_size_var = tk.StringVar(value='重複合計サイズ: 0 B')
+        self.zip_status_var = tk.StringVar(value='ステータス: 待機中')
+        
+        # Treeviewの選択状態
+        self.tree_selection_state = {}
+        self.last_selected_item = None
+        self._suppress_header_toggle = False
+        self._icon_set = False  # アイコン設定フラグ
 
-        top = tk.Frame(root, bg=DARK_BG)
+    def _setup_window(self):
+        self.root.title('Duplicate Link Tool')
+        self.root.geometry('1000x850')
+        self.root.minsize(950, 720)
+        self.root.configure(
+            bg=DARK_BG,
+            highlightthickness=0,
+            highlightbackground=DARK_BG,
+            highlightcolor=DARK_BG,
+            borderwidth=0,
+        )
+        try:
+            icon_path = _resource_path(ASSET_ICON_NAME)
+            if icon_path.exists():
+                # tkinter標準のアイコン設定（フォールバック用）
+                self.root.iconbitmap(default=str(icon_path))
+        except Exception:
+            pass
+
+    def _set_window_icon(self, icon_path: str):
+        """Windows APIを使用してウィンドウとタスクバーに高解像度アイコンを設定"""
+        try:
+            # ウィンドウハンドルを取得
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            
+            # アイコンをロード（大きいアイコン: 256x256または利用可能な最大サイズ）
+            # LR_LOADFROMFILE = 0x0010, LR_DEFAULTSIZE = 0x0040
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE = 0x0040
+            
+            # 大きいアイコン（タスクバー用）
+            icon_large = ctypes.windll.user32.LoadImageW(
+                0, icon_path, IMAGE_ICON, 256, 256, LR_LOADFROMFILE
+            )
+            if not icon_large:
+                # 256x256が失敗した場合は48x48を試す
+                icon_large = ctypes.windll.user32.LoadImageW(
+                    0, icon_path, IMAGE_ICON, 48, 48, LR_LOADFROMFILE
+                )
+            
+            # 小さいアイコン（タイトルバー用）
+            icon_small = ctypes.windll.user32.LoadImageW(
+                0, icon_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE
+            )
+            
+            # ウィンドウにアイコンを設定
+            # WM_SETICON = 0x0080, ICON_BIG = 1, ICON_SMALL = 0
+            WM_SETICON = 0x0080
+            ICON_BIG = 1
+            ICON_SMALL = 0
+            
+            if icon_large:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, icon_large)
+            if icon_small:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon_small)
+        except Exception:
+            pass
+
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure('Treeview', background=DARK_BG, foreground=DARK_FG, fieldbackground=DARK_BG)
+        style.configure('TButton', background=ACCENT, foreground=DARK_FG)
+        style.configure('Horizontal.TProgressbar', troughcolor='#333333', background=ACCENT)
+        style.map('Treeview', background=[('selected', '#2f4f6f')], foreground=[('selected', '#ffffff')])
+
+    def _create_widgets(self):
+        self._create_top_panel()
+        self._create_action_buttons()
+        self._create_progress_and_status()
+        self._create_treeview()
+        self._create_log_area()
+
+    def _create_top_panel(self):
+        top = tk.Frame(self.root, bg=DARK_BG, highlightthickness=0)
         top.pack(padx=10, pady=10, fill='x')
         top.columnconfigure(0, weight=1)
 
-        tk.Label(top, text='1) αディレクトリ', bg=DARK_BG, fg=DARK_FG).grid(row=0, column=0, sticky='w')
-        self.main_entry = HistoryEntry(top, textvariable=self.main_dir, width=80, bg='#2b2b2b', fg=DARK_FG)
-        self.main_entry.grid(row=1, column=0, sticky='we')
-        tk.Button(top, text='選択', command=self.select_main).grid(row=1, column=1, padx=5)
-        tk.Label(top, textvariable=self.main_link_summary_var, bg=DARK_BG, fg=DARK_FG).grid(row=2, column=0, columnspan=2, sticky='w', pady=(2,0))
-
-        tk.Label(top, text='2) βディレクトリ', bg=DARK_BG, fg=DARK_FG).grid(row=3, column=0, sticky='w', pady=(8,0))
-        compare_row_frame = tk.Frame(top, bg=DARK_BG)
-        compare_row_frame.grid(row=4, column=0, columnspan=2, sticky='we')
-        compare_row_frame.columnconfigure(0, weight=1)
+        # αディレクトリ
+        self._create_dir_row(top, 0, 'αディレクトリ', '#5dade2', self.main_dir, self.select_main, self.main_link_summary_var)
         
-        self.compare_entry = HistoryEntry(compare_row_frame, textvariable=self.compare_dir, width=80, bg='#2b2b2b', fg=DARK_FG)
-        self.compare_entry.grid(row=0, column=0, sticky='we')
-        tk.Button(compare_row_frame, text='選択', command=self.select_compare).grid(row=0, column=1, padx=5)
-        self.same_as_main_cb = tk.Checkbutton(
-            compare_row_frame,
-            text='αと同じ',
-            variable=self.use_same_as_main,
-            command=self.on_same_as_main_toggle,
-            bg=DARK_BG,
-            fg=DARK_FG,
-            selectcolor=DARK_BG,
-            activebackground=DARK_BG,
-            activeforeground=DARK_FG
-        )
-        self.same_as_main_cb.grid(row=0, column=2, padx=5)
+        # βディレクトリ
+        self._create_dir_row(top, 3, 'βディレクトリ', '#e59866', self.compare_dir, self.select_compare, self.compare_link_summary_var, is_beta=True)
         
-        tk.Label(top, textvariable=self.compare_link_summary_var, bg=DARK_BG, fg=DARK_FG).grid(row=5, column=0, columnspan=2, sticky='w', pady=(2,0))
+        # 実体化用ディレクトリ
+        self._create_dir_row(top, 6, '実体化用ディレクトリ', '#bb8fce', self.realize_source, self.select_realize_source, self.realize_link_summary_var)
 
-        tk.Label(top, text='実体化して圧縮するディレクトリ', bg=DARK_BG, fg=DARK_FG).grid(row=6, column=0, sticky='w', pady=(8,0))
-        self.realize_entry = HistoryEntry(top, textvariable=self.realize_source, width=80, bg='#2b2b2b', fg=DARK_FG)
-        self.realize_entry.grid(row=7, column=0, sticky='we')
-        tk.Button(top, text='選択', command=self.select_realize_source).grid(row=7, column=1, padx=5)
-        tk.Label(top, textvariable=self.realize_link_summary_var, bg=DARK_BG, fg=DARK_FG).grid(row=8, column=0, columnspan=2, sticky='w', pady=(2,0))
+        # オプション設定
+        self._create_options_area(top)
 
-        tk.Label(top, text='リンク種別', bg=DARK_BG, fg=DARK_FG).grid(row=9, column=0, sticky='w', pady=(8,0))
-        types_frame = tk.Frame(top, bg=DARK_BG)
+    def _create_dir_row(self, parent, row, label, color, var, cmd, summary_var, is_beta=False):
+        # 色付き●のラベル
+        lbl_container = tk.Label(parent, bg=DARK_BG, fg=DARK_FG)
+        lbl_container.grid(row=row, column=0, sticky='w', pady=(8 if row > 0 else 0, 0))
+        tk.Label(parent, text='●', bg=DARK_BG, fg=color, font=('', 12)).place(in_=lbl_container, relx=0, rely=0)
+        tk.Label(parent, text=label, bg=DARK_BG, fg=DARK_FG).place(in_=lbl_container, relx=0, rely=0, x=18)
+        
+        # 入力欄
+        if is_beta:
+            frame = tk.Frame(parent, bg=DARK_BG)
+            frame.grid(row=row+1, column=0, columnspan=2, sticky='we')
+            frame.columnconfigure(0, weight=1)
+            self.compare_entry = HistoryEntry(frame, textvariable=var, width=80, bg='#2b2b2b', fg=DARK_FG, highlightthickness=0)
+            self.compare_entry.grid(row=0, column=0, sticky='we')
+            tk.Button(frame, text='選択', command=cmd).grid(row=0, column=1, padx=5)
+            self.same_as_main_cb = tk.Checkbutton(
+                frame, text='αと同じ', variable=self.use_same_as_main, command=self.on_same_as_main_toggle,
+                bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG, activebackground=DARK_BG, activeforeground=DARK_FG
+            )
+            self.same_as_main_cb.grid(row=0, column=2, padx=5)
+        else:
+            entry = HistoryEntry(parent, textvariable=var, width=80, bg='#2b2b2b', fg=DARK_FG, highlightthickness=0)
+            entry.grid(row=row+1, column=0, sticky='we')
+            tk.Button(parent, text='選択', command=cmd).grid(row=row+1, column=1, padx=5)
+            if label == 'αディレクトリ': self.main_entry = entry
+            elif label == '実体化用ディレクトリ': self.realize_entry = entry
+            
+        # リンク状況サマリー
+        tk.Label(parent, textvariable=summary_var, bg=DARK_BG, fg=DARK_FG).grid(row=row+2, column=0, columnspan=2, sticky='w', pady=(2,0))
+
+    def _create_options_area(self, parent):
+        # リンク種別
+        tk.Label(parent, text='リンク種別', bg=DARK_BG, fg=DARK_FG).grid(row=9, column=0, sticky='w', pady=(8,0))
+        types_frame = tk.Frame(parent, bg=DARK_BG)
         types_frame.grid(row=10, column=0, columnspan=2, sticky='w')
-        for label_text, value in [
-            ('ショートカット', 'ショートカット'),
-            ('シンボリックリンク', 'シンボリックリンク'),
-            ('ハードリンク', 'ハードリンク'),
-            ('ジャンクション (フォルダのみ)', 'ジャンクション'),
-        ]:
-            tk.Radiobutton(
-                types_frame,
-                text=label_text,
-                variable=self.link_type,
-                value=value,
-                bg=DARK_BG,
-                fg=DARK_FG,
-                selectcolor=DARK_BG,
-            ).pack(side='left', padx=4)
+        for label, value in [('ショートカット', 'ショートカット'), ('シンボリックリンク', 'シンボリックリンク'), ('ハードリンク', 'ハードリンク')]:
+            tk.Radiobutton(types_frame, text=label, variable=self.link_type, value=value, command=self._on_link_type_changed,
+                           bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG).pack(side='left', padx=4)
 
-        tk.Label(top, text='リンクパスの形式 (ショートカット/シンボリックリンクのみ)', bg=DARK_BG, fg=DARK_FG).grid(row=11, column=0, sticky='w', pady=(10,0))
-        path_mode_frame = tk.Frame(top, bg=DARK_BG)
-        path_mode_frame.grid(row=12, column=0, columnspan=2, sticky='w')
-        tk.Radiobutton(
-            path_mode_frame,
-            text='相対パス',
-            variable=self.link_path_mode,
-            value='relative',
-            bg=DARK_BG,
-            fg=DARK_FG,
-            selectcolor=DARK_BG,
-        ).pack(side='left', padx=4)
-        tk.Radiobutton(
-            path_mode_frame,
-            text='絶対パス',
-            variable=self.link_path_mode,
-            value='absolute',
-            bg=DARK_BG,
-            fg=DARK_FG,
-            selectcolor=DARK_BG,
-        ).pack(side='left', padx=4)
+        # パス形式
+        tk.Label(parent, text='リンクパスの形式 (シンボリックリンクのみ)', bg=DARK_BG, fg=DARK_FG).grid(row=11, column=0, sticky='w', pady=(10,0))
+        path_frame = tk.Frame(parent, bg=DARK_BG)
+        path_frame.grid(row=12, column=0, columnspan=2, sticky='w')
+        self.path_mode_relative_radio = tk.Radiobutton(path_frame, text='相対パス', variable=self.link_path_mode, value='relative', bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG)
+        self.path_mode_relative_radio.pack(side='left', padx=4)
+        self.path_mode_absolute_radio = tk.Radiobutton(path_frame, text='絶対パス', variable=self.link_path_mode, value='absolute', bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG)
+        self.path_mode_absolute_radio.pack(side='left', padx=4)
 
-        tk.Label(top, text='リンク作成後に残すファイル名', bg=DARK_BG, fg=DARK_FG).grid(row=13, column=0, sticky='w', pady=(10,0))
-        name_frame = tk.Frame(top, bg=DARK_BG)
+        # ファイル名モード
+        tk.Label(parent, text='リンク作成後に残すファイル名 (ショートカット/シンボリックリンクのみ)', bg=DARK_BG, fg=DARK_FG).grid(row=13, column=0, sticky='w', pady=(10,0))
+        name_frame = tk.Frame(parent, bg=DARK_BG)
         name_frame.grid(row=14, column=0, columnspan=2, sticky='w')
-        tk.Radiobutton(
-            name_frame,
-            text='α側の名前を残す',
-            variable=self.link_name_mode,
-            value='keep_main',
-            bg=DARK_BG,
-            fg=DARK_FG,
-            selectcolor=DARK_BG,
-        ).pack(side='left', padx=4)
-        tk.Radiobutton(
-            name_frame,
-            text='β側の名前を残す',
-            variable=self.link_name_mode,
-            value='keep_compare',
-            bg=DARK_BG,
-            fg=DARK_FG,
-            selectcolor=DARK_BG,
-        ).pack(side='left', padx=4)
+        self.name_mode_keep_main_radio = tk.Radiobutton(name_frame, text='α側の名前を残す', variable=self.link_name_mode, value='keep_main', bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG)
+        self.name_mode_keep_main_radio.pack(side='left', padx=4)
+        self.name_mode_keep_compare_radio = tk.Radiobutton(name_frame, text='β側の名前を残す', variable=self.link_name_mode, value='keep_compare', bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG)
+        self.name_mode_keep_compare_radio.pack(side='left', padx=4)
 
-        tk.Label(top, text='リンク化実行時にどちらを残すか', bg=DARK_BG, fg=DARK_FG).grid(row=15, column=0, sticky='w', pady=(10,0))
-        keep_side_frame = tk.Frame(top, bg=DARK_BG)
-        keep_side_frame.grid(row=16, column=0, columnspan=2, sticky='w')
-        tk.Radiobutton(
-            keep_side_frame,
-            text='αを残す（β側をリンク化）',
-            variable=self.keep_side,
-            value='main',
-            bg=DARK_BG,
-            fg=DARK_FG,
-            selectcolor=DARK_BG,
-        ).pack(side='left', padx=4)
-        tk.Radiobutton(
-            keep_side_frame,
-            text='βを残す（α側をリンク化）',
-            variable=self.keep_side,
-            value='compare',
-            bg=DARK_BG,
-            fg=DARK_FG,
-            selectcolor=DARK_BG,
-        ).pack(side='left', padx=4)
+        # 残す側
+        tk.Label(parent, text='リンク化実行時にどちらを残すか (ショートカット/シンボリックリンクのみ)', bg=DARK_BG, fg=DARK_FG).grid(row=15, column=0, sticky='w', pady=(10,0))
+        keep_frame = tk.Frame(parent, bg=DARK_BG)
+        keep_frame.grid(row=16, column=0, columnspan=2, sticky='w')
+        self.keep_side_main_radio = tk.Radiobutton(keep_frame, text='αを残す（β側をリンク化）', variable=self.keep_side, value='main', bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG)
+        self.keep_side_main_radio.pack(side='left', padx=4)
+        self.keep_side_compare_radio = tk.Radiobutton(keep_frame, text='βを残す（α側をリンク化）', variable=self.keep_side, value='compare', bg=DARK_BG, fg=DARK_FG, selectcolor=DARK_BG)
+        self.keep_side_compare_radio.pack(side='left', padx=4)
 
-        btn_frame = tk.Frame(root, bg=DARK_BG)
+    def _create_action_buttons(self):
+        btn_frame = tk.Frame(self.root, bg=DARK_BG, highlightthickness=0)
         btn_frame.pack(pady=6, fill='x', padx=10)
-        
-        # ボタンを中央に配置するための内部フレーム
-        btn_inner = tk.Frame(btn_frame, bg=DARK_BG)
+        btn_inner = tk.Frame(btn_frame, bg=DARK_BG, highlightthickness=0)
         btn_inner.pack()
-        
-        self.detect_btn = tk.Button(btn_inner, text='重複を検出', command=self.detect)
-        self.detect_btn.pack(side='left', padx=6)
-        self.link_btn = tk.Button(btn_inner, text='リンク化を実行', command=self.run_linking)
-        self.link_btn.pack(side='left', padx=6)
-        self.cancel_btn = tk.Button(btn_inner, text='キャンセル', command=self.cancel_process)
-        self.cancel_btn.pack(side='left', padx=6)
-        self.open_main_nondup_btn = tk.Button(
-            btn_inner,
-            text='非重複(α)を開く',
-            command=lambda: self.open_non_duplicates('main'),
-            state='disabled',
-        )
-        self.open_main_nondup_btn.pack(side='left', padx=6)
-        self.open_compare_nondup_btn = tk.Button(
-            btn_inner,
-            text='非重複(β)を開く',
-            command=lambda: self.open_non_duplicates('compare'),
-            state='disabled',
-        )
-        self.open_compare_nondup_btn.pack(side='left', padx=6)
-        self.materialize_btn = tk.Button(btn_inner, text='リンクを実体化', command=self.materialize_links)
-        self.materialize_btn.pack(side='left', padx=6)
-        self.realize_btn = tk.Button(btn_inner, text='実体化して圧縮', command=self.realize_and_zip)
-        self.realize_btn.pack(side='left', padx=6)
-        tk.Button(btn_inner, text='CSV を開く', command=self.open_csv).pack(side='left', padx=6)
 
-        self.progress = ttk.Progressbar(root, mode='determinate', style='Horizontal.TProgressbar')
+        # 検出ボタン
+        self.detect_btn_frame = self._create_custom_btn(btn_inner, '重複を検出', ['#5dade2', '#e59866'], lambda: self.detect())
+        
+        # リンク化ボタン
+        self.link_btn = tk.Button(btn_inner, text='リンク化を実行', command=self.run_linking, padx=5, pady=2)
+        self.link_btn.pack(side='left', padx=6)
+        
+        # キャンセルボタン
+        self.cancel_btn = tk.Button(btn_inner, text='キャンセル', command=self.cancel_process, padx=5, pady=2)
+        self.cancel_btn.pack(side='left', padx=6)
+        
+        # 非重複(α)を開くボタン
+        self.open_main_nondup_btn_frame = self._create_custom_btn(btn_inner, '非重複(α)を開く', ['#5dade2'], 
+            lambda: self.open_non_duplicates('main'), check_relief=True)
+            
+        # 非重複(β)を開くボタン
+        self.open_compare_nondup_btn_frame = self._create_custom_btn(btn_inner, '非重複(β)を開く', ['#e59866'], 
+            lambda: self.open_non_duplicates('compare'), check_relief=True)
+            
+        # 実体化ボタン
+        self.materialize_btn_frame = self._create_custom_btn(btn_inner, 'リンクを実体化', ['#bb8fce'], lambda: self.materialize_links())
+        
+        # 実体化して圧縮ボタン
+        self.realize_btn_frame = self._create_custom_btn(btn_inner, '実体化して圧縮', ['#bb8fce'], lambda: self.realize_and_zip())
+        
+        # CSV を開くボタン
+        tk.Button(btn_inner, text='CSV を開く', command=self.open_csv, padx=5, pady=2).pack(side='left', padx=6)
+
+    def _create_custom_btn(self, parent, text, colors, command, check_relief=False):
+        frame = tk.Frame(parent, relief='raised', bd=2)
+        frame.pack(side='left', padx=6)
+        label_frame = tk.Frame(frame, bg='SystemButtonFace')
+        label_frame.pack(padx=5, pady=1)
+        for c in colors:
+            tk.Label(label_frame, text='●', fg=c, bg='SystemButtonFace', font=('', 10)).pack(side='left')
+        tk.Label(label_frame, text=text, bg='SystemButtonFace').pack(side='left')
+        
+        def on_click(e):
+            if check_relief and frame['relief'] == 'sunken':
+                return
+            # クリックされたボタンを一時的にsunkenにする
+            original_relief = frame['relief']
+            frame.config(relief='sunken')
+            frame.update_idletasks()
+            # 少し遅延して元に戻す
+            def restore():
+                frame.config(relief=original_relief)
+                command()
+            frame.after(100, restore)
+            
+        frame.bind('<Button-1>', on_click)
+        for child in label_frame.winfo_children():
+            child.bind('<Button-1>', on_click)
+        return frame
+
+    def _create_progress_and_status(self):
+        self.progress = ttk.Progressbar(self.root, mode='determinate', style='Horizontal.TProgressbar')
         self.progress.pack(pady=8, fill='x', padx=10)
         
         self.count_label = tk.Label(
-            root,
+            self.root,
             text='重複検出数: 0 件 / 非重複(α): 0 件 / 非重複(β): 0 件',
             bg=DARK_BG,
             fg=DARK_FG,
         )
         self.count_label.pack(padx=10)
-        self.total_size_var = tk.StringVar(value='重複合計サイズ: 0 B')
-        self.total_size_label = tk.Label(root, textvariable=self.total_size_var, bg=DARK_BG, fg=DARK_FG)
+        
+        self.total_size_label = tk.Label(self.root, textvariable=self.total_size_var, bg=DARK_BG, fg=DARK_FG)
         self.total_size_label.pack(padx=10)
-        self.zip_status_var = tk.StringVar(value='ステータス: 待機中')
-        self.zip_status_label = tk.Label(root, textvariable=self.zip_status_var, bg=DARK_BG, fg=DARK_FG)
+        
+        self.zip_status_label = tk.Label(self.root, textvariable=self.zip_status_var, bg=DARK_BG, fg=DARK_FG)
         self.zip_status_label.pack(padx=10)
 
-        tree_container = tk.Frame(root, bg=DARK_BG)
+    def _create_treeview(self):
+        tree_container = tk.Frame(self.root, bg=DARK_BG, highlightthickness=0)
         tree_container.pack(fill='both', expand=True, padx=10, pady=(6, 3))
 
-        tree_frame = tk.Frame(tree_container, bg=DARK_BG)
+        tree_frame = tk.Frame(tree_container, bg=DARK_BG, highlightthickness=0)
         tree_frame.pack(fill='both', expand=True, padx=0, pady=0)
         self.tree = ttk.Treeview(tree_frame, columns=('select', 'main', 'dup', 'reason'), show='headings', height=13, selectmode='browse')
         self.tree.heading('select', text='☐', command=lambda: self.toggle_all_selection())
@@ -890,24 +975,19 @@ class App:
         self.tree.column('main', width=360)
         self.tree.column('dup', width=360)
         self.tree.column('reason', width=200)
+        
         tree_scroll_y = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll_y.set)
         tree_scroll_y.pack(side='right', fill='y')
         self.tree.pack(fill='both', expand=True, side='left')
-        
-        # 選択状態を管理する辞書（item_id → bool）
-        self.tree_selection_state = {}
-        # 最後に選択されたアイテム（Shift選択用）
-        self.last_selected_item = None
-        # ヘッダーチェックボックスの不要な再トグルを防ぐフラグ
-        self._suppress_header_toggle = False
 
-        log_container = tk.Frame(root, bg=DARK_BG, height=180)
+    def _create_log_area(self):
+        log_container = tk.Frame(self.root, bg=DARK_BG, height=180, highlightthickness=0)
         log_container.pack(fill='both', expand=False, padx=10, pady=(0, 10))
         log_container.pack_propagate(False)
 
         tk.Label(log_container, text='ログ', bg=DARK_BG, fg=DARK_FG, anchor='w').pack(fill='x', padx=0)
-        log_frame = tk.Frame(log_container, bg=DARK_BG)
+        log_frame = tk.Frame(log_container, bg=DARK_BG, highlightthickness=0)
         log_frame.pack(fill='both', expand=True, padx=0)
         self.log = tk.Text(log_frame, bg='#2b2b2b', fg=DARK_FG, wrap='word')
         log_scroll_y = ttk.Scrollbar(log_frame, orient='vertical', command=self.log.yview)
@@ -915,11 +995,9 @@ class App:
         log_scroll_y.pack(side='right', fill='y')
         self.log.pack(fill='both', expand=True, side='left')
 
-        # Treeviewのイベントバインド
+    def _bind_events(self):
         self.tree.bind('<ButtonRelease-1>', self.on_tree_click)
         self.tree.bind('<Button-1>', self.on_tree_button_down)
-        self._adjust_initial_geometry()
-        self.root.after(200, self._ensure_front)
     
     def toggle_all_selection(self):
         """全選択/全解除を切り替え"""
@@ -1045,6 +1123,14 @@ class App:
         # 範囲選択後はlast_selected_itemを更新しない
         # これにより次のクリックが新しい起点として扱われる
     
+    def log_separator(self, title: str = ''):
+        """ログに区切り線を追加"""
+        if title:
+            separator = f'===== {title} {"=" * (50 - len(title) - 7)}'
+        else:
+            separator = '=' * 50
+        self.log_message(separator)
+    
     def log_message(self, msg):
         timestamp = datetime.datetime.now().strftime('%H:%M:%S')
         line = f'[{timestamp}] {msg}\n'
@@ -1074,8 +1160,52 @@ class App:
             self.root.focus_force()
             self.root.attributes('-topmost', True)
             self.root.after(800, lambda: self.root.attributes('-topmost', False))
+            # ウィンドウ表示後に高解像度アイコンを設定（初回のみ）
+            if not self._icon_set:
+                self.root.after(100, self._apply_high_res_icon)
         except Exception:
             pass
+
+    def _apply_high_res_icon(self):
+        """ウィンドウ表示後に高解像度アイコンを適用"""
+        if self._icon_set:
+            return
+        try:
+            icon_path = _resource_path(ASSET_ICON_NAME)
+            if icon_path.exists():
+                self._set_window_icon(str(icon_path))
+                self._icon_set = True
+        except Exception:
+            pass
+
+    def _on_link_type_changed(self):
+        """リンクタイプが変更されたときに無関係な設定を無効化"""
+        link_type = self.link_type.get()
+        
+        # シンボリックリンク: すべての設定が有効
+        if link_type == 'シンボリックリンク':
+            self.path_mode_relative_radio.config(state='normal')
+            self.path_mode_absolute_radio.config(state='normal')
+            self.name_mode_keep_main_radio.config(state='normal')
+            self.name_mode_keep_compare_radio.config(state='normal')
+            self.keep_side_main_radio.config(state='normal')
+            self.keep_side_compare_radio.config(state='normal')
+        # ショートカット: パス形式は無関係（内部的に常に絶対パス）、ファイル名・どちらを残すかは有効
+        elif link_type == 'ショートカット':
+            self.path_mode_relative_radio.config(state='disabled')
+            self.path_mode_absolute_radio.config(state='disabled')
+            self.name_mode_keep_main_radio.config(state='normal')
+            self.name_mode_keep_compare_radio.config(state='normal')
+            self.keep_side_main_radio.config(state='normal')
+            self.keep_side_compare_radio.config(state='normal')
+        # ハードリンク: パス形式・ファイル名・どちらを残すかは無関係
+        else:
+            self.path_mode_relative_radio.config(state='disabled')
+            self.path_mode_absolute_radio.config(state='disabled')
+            self.name_mode_keep_main_radio.config(state='disabled')
+            self.name_mode_keep_compare_radio.config(state='disabled')
+            self.keep_side_main_radio.config(state='disabled')
+            self.keep_side_compare_radio.config(state='disabled')
 
     def _adjust_initial_geometry(self) -> None:
         try:
@@ -1103,7 +1233,7 @@ class App:
         for item_id in self.tree.get_children():
             if self.tree_selection_state.get(item_id, False):
                 values = self.tree.item(item_id, 'values')
-                if len(values) >= 4:  # select, main, dup, reason
+                if len(values) >= 4:  # select, α, β, 判定内容
                     selected.append({
                         'item_id': item_id,
                         'main': values[1],
@@ -1228,8 +1358,8 @@ class App:
         self.cancel_flag.clear()
         self.compare_non_duplicates.clear()
         self.main_non_duplicates.clear()
-        self.open_compare_nondup_btn.config(state='disabled')
-        self.open_main_nondup_btn.config(state='disabled')
+        self.open_compare_nondup_btn_frame.config(relief='sunken')
+        self.open_main_nondup_btn_frame.config(relief='sunken')
         self.count_label.config(
             text='重複検出数: 集計中... / 非重複(α): 集計中... / 非重複(β): 集計中...'
         )
@@ -1254,19 +1384,20 @@ class App:
                 self.zip_status_var,
                 self.compare_non_duplicates,
                 self.main_non_duplicates,
-                self.open_compare_nondup_btn,
-                self.open_main_nondup_btn,
+                self.open_compare_nondup_btn_frame,
+                self.open_main_nondup_btn_frame,
                 self.cancel_flag,
                 self.root,
                 self.log_message,
             ),
             daemon=True,
         ).start()
+        self.log_separator('重複検出開始')
         self.log_message('重複検出を開始しました')
 
     def _open_pair_from_item(self, item_id):
         values = self.tree.item(item_id, 'values')
-        if len(values) < 3:  # select, main, dup, reason
+        if len(values) < 3:  # select, α, β, 判定内容
             return
         # values[0]はチェックボックス、values[1]がα、values[2]がβ
         main_path, duplicate_path = values[1], values[2]
@@ -1302,35 +1433,67 @@ class App:
             messagebox.showinfo('情報', f'{label}側で重複として検出されなかったファイルはありません。')
             return
 
+        # キャンセルフラグをクリアしてボタンを無効化
+        self.cancel_flag.clear()
+        self._set_action_buttons(True)
+        self.log_message(f'{label}側の非重複ファイル {len(targets)} 件をエクスプローラーで開きます...')
+        threading.Thread(target=self._open_non_duplicates_worker, args=(targets, label), daemon=True).start()
+
+    def _open_non_duplicates_worker(self, targets: list, label: str):
         opened = 0
+        cancelled = False
+        
         for path in targets:
+            # キャンセルフラグをチェック
+            if self.cancel_flag.is_set():
+                cancelled = True
+                self.log_message(f'ユーザーがキャンセルしました（{opened}/{len(targets)}件開きました）')
+                break
+            
             if self._open_in_explorer(path):
                 opened += 1
             else:
                 self.log_message(f'[WARN] 非重複ファイルを開けませんでした ({label}): {path}')
+            
+            # 連続して開く際の負荷を軽減（少し間を空ける）
+            time.sleep(0.5)
 
-        if opened == 0:
-            messagebox.showwarning('警告', f'非重複ファイルをエクスプローラーで開けませんでした ({label}側)。')
-        else:
-            self.log_message(f'{label}側の非重複ファイル {opened} 件をエクスプローラーで開きました')
+        if not cancelled:
+            if opened == 0:
+                self.root.after(0, lambda: messagebox.showwarning('警告', f'非重複ファイルをエクスプローラーで開けませんでした ({label}側)。'))
+            else:
+                self.log_message(f'{label}側の非重複ファイル {opened} 件をエクスプローラーで開きました')
+        
+        # ボタンを再有効化
+        self.root.after(0, lambda: self._set_action_buttons(False))
 
     def _set_action_buttons(self, busy: bool):
         state = 'disabled' if busy else 'normal'
-        self.detect_btn.config(state=state)
+        # 通常のボタン
         self.link_btn.config(state=state)
-        self.cancel_btn.config(state=state)
-        self.realize_btn.config(state=state)
-        self.materialize_btn.config(state=state)
+        # キャンセルボタンは常に有効
+        self.cancel_btn.config(state='normal')
+        
+        # Frameベースのボタン（reliefで無効状態を表現）
         if busy:
-            self.open_compare_nondup_btn.config(state='disabled')
-            self.open_main_nondup_btn.config(state='disabled')
+            self.detect_btn_frame.config(relief='sunken')
+            self.materialize_btn_frame.config(relief='sunken')
+            self.realize_btn_frame.config(relief='sunken')
+            self.open_main_nondup_btn_frame.config(relief='sunken')
+            self.open_compare_nondup_btn_frame.config(relief='sunken')
         else:
-            self.open_compare_nondup_btn.config(
-                state='normal' if self.compare_non_duplicates else 'disabled'
-            )
-            self.open_main_nondup_btn.config(
-                state='normal' if self.main_non_duplicates else 'disabled'
-            )
+            self.detect_btn_frame.config(relief='raised')
+            self.materialize_btn_frame.config(relief='raised')
+            self.realize_btn_frame.config(relief='raised')
+            # 非重複ボタンは条件付き
+            if self.main_non_duplicates:
+                self.open_main_nondup_btn_frame.config(relief='raised')
+            else:
+                self.open_main_nondup_btn_frame.config(relief='sunken')
+            if self.compare_non_duplicates:
+                self.open_compare_nondup_btn_frame.config(relief='raised')
+            else:
+                self.open_compare_nondup_btn_frame.config(relief='sunken')
 
     def _set_realize_progress(self, value: float, status_text: str):
         self.progress['value'] = value
@@ -1339,12 +1502,12 @@ class App:
     def realize_and_zip(self):
         source_value = self.realize_source.get()
         if not source_value:
-            messagebox.showwarning('警告', '実体化して圧縮するディレクトリを選択してください。')
+            messagebox.showwarning('警告', '実体化用ディレクトリを選択してください。')
             return
 
         source_path = Path(source_value)
         if not source_path.exists():
-            messagebox.showerror('エラー', f'実体化ディレクトリが存在しません: {source_path}')
+            messagebox.showerror('エラー', f'実体化用ディレクトリが存在しません: {source_path}')
             return
 
         default_name = f'{source_path.name}_realized.zip' if source_path.name else 'realized.zip'
@@ -1420,7 +1583,6 @@ class App:
         mapping = {
             'target_missing': '元ファイルが見つかりません',
             'hardlink_requires_file': 'ハードリンクはファイルにのみ適用できます',
-            'junction_requires_directory': 'ジャンクションはフォルダにのみ適用できます',
             'powershell_not_found': 'PowerShell が見つからないためショートカットを作成できません',
             'unsupported_link_type': '未対応のリンク種別です',
         }
@@ -1459,6 +1621,25 @@ class App:
             return 'ジャンクション'
 
         return '実体'
+    
+    def _is_any_link(self, path: Path) -> bool:
+        """
+        ファイルが何らかのリンク（ショートカット、シンボリックリンク、ハードリンク、ジャンクション）かを判定
+        """
+        try:
+            # ショートカットの判定
+            if path.suffix.lower() == '.lnk' and path.exists():
+                return True
+            # シンボリックリンク・ジャンクションの判定
+            if path.is_symlink():
+                return True
+            # ハードリンクの判定（リンク数が2以上）
+            st = os.lstat(path)
+            if not path.is_dir() and getattr(st, 'st_nlink', 1) > 1:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _unique_path(self, base_dir: Path, prefix: str, suffix: str = '') -> Path:
         for _ in range(1000):
@@ -1571,10 +1752,12 @@ class App:
         return False, False, None, None
 
     def materialize_links(self):
-        directory = filedialog.askdirectory(title='リンクを実体化するディレクトリを選択')
-        if not directory:
+        source_value = self.realize_source.get()
+        if not source_value:
+            messagebox.showwarning('警告', '実体化用ディレクトリを選択してください。')
             return
-        target_path = Path(directory)
+
+        target_path = Path(source_value)
         if not target_path.exists():
             messagebox.showerror('エラー', f'ディレクトリが存在しません: {target_path}')
             return
@@ -1689,23 +1872,38 @@ class App:
                 continue
 
             values = self.tree.item(item, 'values')
-            if len(values) < 3:  # select, main, dup が必要
+            if len(values) < 3:  # select, α, β が必要
                 continue
 
             main_path = Path(values[1])  # values[0]はチェックボックス
             duplicate_path = Path(values[2])
+            
+            # 【重要】双方向リンク防止：両方がリンクの場合はスキップ
+            main_is_link = self._is_any_link(main_path)
+            dup_is_link = self._is_any_link(duplicate_path)
+            
+            if main_is_link and dup_is_link:
+                fail += 1
+                self.log_message(f'[FAIL] 双方がリンクのため処理をスキップ（実体消滅を防止）: α={main_path}, β={duplicate_path}')
+                continue
 
-            # keep_sideに基づいてtargetとlinkを決定
+            # keep_sideに基づいてターゲットとリンクを決定
             if keep_side == 'main':
                 # αを残す：α→ターゲット、β→リンク
                 target_path = main_path
                 link_base = duplicate_path if name_mode == 'keep_compare' else duplicate_path.with_name(main_path.name)
                 original_to_delete = duplicate_path
+                # αがリンクの場合は警告
+                if main_is_link:
+                    self.log_message(f'[WARN] α側がリンクですが、そのまま処理を続行します: {main_path}')
             else:
                 # βを残す：β→ターゲット、α→リンク
                 target_path = duplicate_path
                 link_base = main_path if name_mode == 'keep_main' else main_path.with_name(duplicate_path.name)
                 original_to_delete = main_path
+                # βがリンクの場合は警告
+                if dup_is_link:
+                    self.log_message(f'[WARN] β側がリンクですが、そのまま処理を続行します: {duplicate_path}')
 
             if not target_path.exists():
                 fail += 1
@@ -1767,9 +1965,11 @@ class App:
                     # パス形式を判定（相対パスかどうか）
                     is_relative = not Path(target_str).is_absolute() if target_str else False
                     path_type_label = ", 相対パス" if is_relative else ", 絶対パス"
+                    # 残した側を取得
+                    kept_side = "α側" if keep_side == 'main' else "β側"
                     # ログには絶対パスを表示
                     target_display = str(target_abs)
-                    self.log_message(f'[OK] {link_str} -> {target_display} (ショートカット{path_type_label})')
+                    self.log_message(f'[OK] {link_str} -> {target_display} (ショートカット{path_type_label}, {kept_side}を残してリンク化)')
                     actual_kind = self._classify_link_path(link_path)
                     if actual_kind not in ('実体', 'missing') and actual_kind != 'ショートカット':
                         self.log_message(f'[WARN] 実際のリンク種別が想定と異なります: 要求=ショートカット, 実際={actual_kind} ({link_str})')
@@ -1803,7 +2003,7 @@ class App:
 
     def _post_linking_ui_updates(self, main_path: str, compare_path: str, realize_path: str) -> None:
         self.link_btn.config(state='normal')
-        self.detect_btn.config(state='normal')
+        self.detect_btn_frame.config(relief='raised')
         if main_path:
             self._schedule_link_summary(main_path, self.main_link_summary_var)
         if compare_path:
@@ -1832,10 +2032,11 @@ class App:
         path_label = '相対パス' if path_mode == 'relative' else '絶対パス'
         keep_label = 'αを残す（β側をリンク化）' if keep_side == 'main' else 'βを残す（α側をリンク化）'
         
+        self.log_separator('リンク化処理開始')
         self.log_message(f'リンク処理を開始: 種別={link_type}, ファイル名モード={mode_label}, パス形式={path_label}, 残す側={keep_label}, 選択数={selected_count}件')
         self.cancel_flag.clear()
         self.link_btn.config(state='disabled')
-        self.detect_btn.config(state='disabled')
+        self.detect_btn_frame.config(relief='sunken')
         threading.Thread(target=self._linking_worker, args=(link_type, name_mode, path_mode, keep_side), daemon=True).start()
 
     def _linking_worker(self, link_type: str, name_mode: str, path_mode: str, keep_side: str):
@@ -1859,21 +2060,36 @@ class App:
                 continue
 
             values = self.tree.item(item, 'values')
-            if len(values) < 3:  # select, main, dup が必要
+            if len(values) < 3:  # select, α, β が必要
                 continue
 
             main_path = Path(values[1])  # values[0]はチェックボックス
             duplicate_path = Path(values[2])
+            
+            # 【重要】双方向リンク防止：両方がリンクの場合はスキップ
+            main_is_link = self._is_any_link(main_path)
+            dup_is_link = self._is_any_link(duplicate_path)
+            
+            if main_is_link and dup_is_link:
+                fail += 1
+                self.log_message(f'[FAIL] 双方がリンクのため処理をスキップ（実体消滅を防止）: α={main_path}, β={duplicate_path}')
+                continue
 
-            # keep_sideに基づいてtargetとlinkを決定
+            # keep_sideに基づいてターゲットとリンクを決定
             if keep_side == 'main':
                 # αを残す：α→ターゲット、β→リンク
                 target_path = main_path
                 link_path = duplicate_path if name_mode == 'keep_compare' else duplicate_path.with_name(main_path.name)
+                # αがリンクの場合は警告
+                if main_is_link:
+                    self.log_message(f'[WARN] α側がリンクですが、そのまま処理を続行します: {main_path}')
             else:
                 # βを残す：β→ターゲット、α→リンク
                 target_path = duplicate_path
                 link_path = main_path if name_mode == 'keep_main' else main_path.with_name(duplicate_path.name)
+                # βがリンクの場合は警告
+                if dup_is_link:
+                    self.log_message(f'[WARN] β側がリンクですが、そのまま処理を続行します: {duplicate_path}')
 
             if not target_path.exists():
                 fail += 1
@@ -1916,9 +2132,15 @@ class App:
                 link_str = str(link_display)
                 target_str = str(target_path)
                 
-                # パス形式を表示
-                path_type_label = f", {path_mode}パス" if link_type in ['シンボリックリンク', 'ショートカット'] else ""
-                self.log_message(f'[OK] {link_str} -> {target_str} ({link_type}{path_type_label})')
+                # リンクタイプに応じたログメッセージ
+                if link_type in ['ショートカット', 'シンボリックリンク']:
+                    # ショートカット/シンボリックリンク: パス形式と残した側を表示
+                    path_type_label = f", {path_mode}パス"
+                    kept_side = "α側" if keep_side == 'main' else "β側"
+                    self.log_message(f'[OK] {link_str} -> {target_str} ({link_type}{path_type_label}, {kept_side}を残してリンク化)')
+                else:
+                    # ハードリンク: シンプルな表示（ファイル名や残す側は関係ない）
+                    self.log_message(f'[OK] {link_str} ⇔ {target_str} ({link_type})')
                 
                 actual_kind = self._classify_link_path(Path(link_display))
                 if actual_kind not in ('実体', 'missing') and actual_kind != link_type:
@@ -1937,6 +2159,7 @@ class App:
         if created_counts:
             detail = ', '.join(f'{lt}: {cnt}件' for lt, cnt in created_counts.items())
             self.log_message(f'作成されたリンクの内訳: {detail}')
+        self.log_separator('リンク化処理終了')
 
         main_value = self.main_dir.get()
         compare_value = self.compare_dir.get()

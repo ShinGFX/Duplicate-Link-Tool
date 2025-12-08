@@ -20,10 +20,36 @@ def _ps_escape(value: str) -> str:
 
 
 def resolve_shortcut(path: Path) -> Tuple[bool, Optional[Path], Optional[str]]:
+    """ショートカットのリンク先を解決する。
+    
+    Windowsのショートカット追跡機能を使用して、移動されたリンク先を自動的に検索・更新します。
+    """
+    # SLR_UPDATE (0x4) + SLR_NO_UI (0x1) = リンク先を検索して更新、UIなし
     command = (
         "$shell = New-Object -ComObject WScript.Shell;"
         f"$lnk = $shell.CreateShortcut('{_ps_escape(str(path))}');"
-        "if ($lnk -and $lnk.TargetPath) { Write-Output $lnk.TargetPath }"
+        "if ($lnk -and $lnk.TargetPath) {"
+        "  $target = $lnk.TargetPath;"
+        "  if (-not (Test-Path $target)) {"
+        "    try {"
+        "      $shellApp = New-Object -ComObject Shell.Application;"
+        "      $folder = $shellApp.NameSpace((Split-Path $lnk.FullName -Parent));"
+        "      $item = $folder.ParseName((Split-Path $lnk.FullName -Leaf));"
+        "      if ($item) {"
+        "        $link = $item.GetLink;"
+        "        if ($link) {"
+        "          $link.Resolve(5);"  # SLR_UPDATE | SLR_NO_UI
+        "          $target = $link.Path;"
+        "          if ($target -and (Test-Path $target)) {"
+        "            $lnk.TargetPath = $target;"
+        "            $lnk.Save();"
+        "          }"
+        "        }"
+        "      }"
+        "    } catch { }"
+        "  }"
+        "  Write-Output $target"
+        "}"
     )
     try:
         result = subprocess.run(
