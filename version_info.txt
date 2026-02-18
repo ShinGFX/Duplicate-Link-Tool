@@ -1,7 +1,7 @@
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(2, 0, 0, 0),
-        prodvers=(2, 0, 0, 0),
+        filevers=(2, 1, 0, 0),
+        prodvers=(2, 1, 0, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
                 [
                     StringStruct('CompanyName', 'ShinGFX'),
                     StringStruct('FileDescription', 'Duplicate Link Tool'),
-                    StringStruct('FileVersion', '2.0.0'),
+                    StringStruct('FileVersion', '2.1.0'),
                     StringStruct('InternalName', 'DuplicateLinkTool'),
-                    StringStruct('LegalCopyright', '© 2025 ShinGFX'),
+                    StringStruct('LegalCopyright', '© 2026 ShinGFX'),
                     StringStruct('OriginalFilename', 'DuplicateLinkTool.exe'),
                     StringStruct('ProductName', 'Duplicate Link Tool'),
-                    StringStruct('ProductVersion', '2.0.0'),
+                    StringStruct('ProductVersion', '2.1.0'),
                 ]
             )
         ]),

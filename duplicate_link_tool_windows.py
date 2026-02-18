@@ -172,15 +172,65 @@ def _resource_path(relative: str) -> Path:
 FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 CREATE_NO_WINDOW = 0x08000000
 
+def _find_powershell() -> Optional[str]:
+    """PowerShellの実行ファイルパスを取得"""
+    # 1. PATHからpowershell.exeを検索
+    ps_path = shutil.which('powershell')
+    if ps_path:
+        return ps_path
+    
+    # 2. 標準的なWindowsのパスを試す
+    standard_paths = [
+        r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+        r'C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe',
+    ]
+    for path in standard_paths:
+        if os.path.exists(path):
+            return path
+    
+    # 3. PowerShell Core (pwsh) を試す
+    pwsh_path = shutil.which('pwsh')
+    if pwsh_path:
+        return pwsh_path
+    
+    return None
+
 
 def _powershell_escape(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _get_short_path(long_path: str) -> str:
+    """Win32 APIでパスの8.3短縮形式を取得する。失敗時は元のパスを返す。"""
+    try:
+        buf_size = ctypes.windll.kernel32.GetShortPathNameW(long_path, None, 0)
+        if buf_size == 0:
+            return long_path
+        buf = ctypes.create_unicode_buffer(buf_size)
+        result = ctypes.windll.kernel32.GetShortPathNameW(long_path, buf, buf_size)
+        if result == 0:
+            return long_path
+        return buf.value
+    except Exception:
+        return long_path
+
+
+MAX_SHORTCUT_PATH = 259  # WScript.Shell.CreateShortcut のパス上限（ANSIバイト数）
+
+
+def _ansi_path_len(path: str) -> int:
+    """パスのANSI(cp932)バイト数を返す。CreateShortcutはANSI API経由でパス長をチェックするため。"""
+    try:
+        return len(path.encode('cp932', errors='replace'))
+    except Exception:
+        return len(path)
 
 
 def _build_shortcut_batch_script(entries: list[tuple[str, str]]) -> str:
     lines = [
         "$ErrorActionPreference = 'Stop'",
         "$shell = New-Object -ComObject WScript.Shell",
+        "$tempDir = $env:TEMP",
         "try {",
     ]
     for link, target in entries:
@@ -190,7 +240,16 @@ def _build_shortcut_batch_script(entries: list[tuple[str, str]]) -> str:
         # ターゲットが相対パスかどうか判定
         is_relative = not Path(target).is_absolute()
         
-        lines.append(f"    $lnk = $shell.CreateShortcut('{escaped_link}')")
+        needs_temp = _ansi_path_len(link) > MAX_SHORTCUT_PATH
+        
+        if needs_temp:
+            # パスが長い場合: 一時ディレクトリに短い名前で作成後、長いパスへ移動
+            temp_name = f"_dlt_tmp_{uuid.uuid4().hex[:8]}.lnk"
+            escaped_temp = _powershell_escape(f"$tempDir\\{temp_name}")
+            lines.append(f"    $tempLnk = Join-Path $tempDir '{temp_name}'")
+            lines.append(f"    $lnk = $shell.CreateShortcut($tempLnk)")
+        else:
+            lines.append(f"    $lnk = $shell.CreateShortcut('{escaped_link}')")
         
         if is_relative:
             # 相対パスの場合：WorkingDirectoryを設定し、TargetPathは絶対パスに変換
@@ -205,6 +264,11 @@ def _build_shortcut_batch_script(entries: list[tuple[str, str]]) -> str:
             lines.append(f"    $lnk.TargetPath = '{escaped_target}'")
         
         lines.append("    $lnk.Save()")
+        
+        if needs_temp:
+            # 一時ファイルを長いパスの最終位置へ移動（.NETのlong path対応APIを使用）
+            lines.append(f"    [System.IO.File]::Move($tempLnk, '\\\\?\\{escaped_link}')")
+    
     lines.extend(
         [
             "}",
@@ -223,6 +287,11 @@ def _run_shortcut_batch(entries: list[tuple[str, str]], *, script: Optional[str]
     if script is None:
         script = _build_shortcut_batch_script(entries)
 
+    # PowerShellの実行ファイルパスを取得
+    powershell_path = _find_powershell()
+    if not powershell_path:
+        return False, 'powershell_not_found'
+
     temp_script_path: Optional[str] = None
     try:
         # UTF-8 BOMを使用してPowerShellが正しく認識できるようにする
@@ -233,7 +302,7 @@ def _run_shortcut_batch(entries: list[tuple[str, str]], *, script: Optional[str]
 
         result = subprocess.run(
             [
-                'powershell',
+                powershell_path,
                 '-NoProfile',
                 '-NonInteractive',
                 '-ExecutionPolicy',
@@ -246,7 +315,8 @@ def _run_shortcut_batch(entries: list[tuple[str, str]], *, script: Optional[str]
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            encoding='utf-8',  # 出力もUTF-8として扱う
+            encoding='cp932',
+            errors='replace',
             creationflags=CREATE_NO_WINDOW,
         )
     except FileNotFoundError:
@@ -261,7 +331,9 @@ def _run_shortcut_batch(entries: list[tuple[str, str]], *, script: Optional[str]
                 pass
 
     ok = result.returncode == 0
-    msg = result.stderr.strip() or result.stdout.strip()
+    stderr_text = (result.stderr or '').strip()
+    stdout_text = (result.stdout or '').strip()
+    msg = stderr_text or stdout_text
     return ok, msg
 
 # ---- ユーティリティ ----
@@ -315,9 +387,16 @@ def find_duplicates(
     
     # 同じフォルダ比較かどうかを判定
     is_same_folder = normalize(main_dir) == normalize(compare_dir)
+    # ディレクトリの包含関係（親子関係）を判定
+    norm_main = normalize(main_dir).rstrip(os.sep) + os.sep
+    norm_compare = normalize(compare_dir).rstrip(os.sep) + os.sep
+    is_overlapping = is_same_folder or norm_main.startswith(norm_compare) or norm_compare.startswith(norm_main)
     if is_same_folder:
         if log_callback:
             log_callback('同じフォルダ内での重複検出を開始します（同一ファイルパスの組み合わせは除外）')
+    elif is_overlapping:
+        if log_callback:
+            log_callback('ディレクトリが重複しています（同一ファイルパスの組み合わせは除外）')
 
     main_files = collect_files(main_dir)
     
@@ -384,8 +463,8 @@ def find_duplicates(
         except Exception:
             return None
 
-        # 同じフォルダ比較時用：このファイルの正規化パス
-        path_normalized = normalize(path) if is_same_folder else ""
+        # 同じフォルダ/重複ディレクトリ比較時用：このファイルの正規化パス
+        path_normalized = normalize(path)
 
         name = os.path.basename(path)
         primary_candidates = list(main_lookup.get((name, size), []))
@@ -408,11 +487,11 @@ def find_duplicates(
             except Exception:
                 pass
             
-            # 同じフォルダ比較時：同一ファイルパス同士の比較はスキップ
-            if is_same_folder and normalize(candidate) == path_normalized:
+            # 同一ファイルパス同士の比較はスキップ（ディレクトリの重複・包含関係に対応）
+            if normalize(candidate) == path_normalized:
                 continue
             # 同じフォルダ比較時：辞書順で候補が現在のパスより大きい場合はスキップ（逆順での重複検出を防止）
-            if is_same_folder and path_normalized and normalize(candidate) > path_normalized:
+            if is_same_folder and normalize(candidate) > path_normalized:
                 continue
             return (candidate, path, 'name+size')
 
@@ -442,11 +521,11 @@ def find_duplicates(
             except Exception:
                 pass
             
-            # 同じフォルダ比較時：同一ファイルパス同士の比較はスキップ
-            if is_same_folder and normalize(candidate) == path_normalized:
+            # 同一ファイルパス同士の比較はスキップ（ディレクトリの重複・包含関係に対応）
+            if normalize(candidate) == path_normalized:
                 continue
             # 同じフォルダ比較時：辞書順で候補が現在のパスより大きい場合はスキップ（逆順での重複検出を防止）
-            if is_same_folder and path_normalized and normalize(candidate) > path_normalized:
+            if is_same_folder and normalize(candidate) > path_normalized:
                 continue
 
             main_hash = get_main_hash(candidate)
@@ -475,12 +554,15 @@ def find_duplicates(
             if res:
                 results.append(res)
 
-    # 同じフォルダ比較時：重複ペアの逆順を除去（念のための二重チェック）
-    if is_same_folder and results:
+    # 重複ペアの逆順・同一パスペアを除去（ディレクトリ重複時も対応）
+    if results:
         original_count = len(results)
         seen_pairs = set()
         unique_results = []
         for main_path, compare_path, reason in results:
+            # 同一パスのペアを除外
+            if normalize(main_path) == normalize(compare_path):
+                continue
             # 正規化パスのペアを作成（順序を統一）
             pair = tuple(sorted([normalize(main_path), normalize(compare_path)]))
             if pair not in seen_pairs:
@@ -488,7 +570,7 @@ def find_duplicates(
                 unique_results.append((main_path, compare_path, reason))
         if len(unique_results) < original_count and log_callback:
             removed = original_count - len(unique_results)
-            log_callback(f'重複ペアの逆順を除去: {removed} 件（最終結果: {len(unique_results)} 件）')
+            log_callback(f'重複ペアの逆順・同一パスを除去: {removed} 件（最終結果: {len(unique_results)} 件）')
         results = unique_results
 
     # 同じフォルダ比較の場合、重複ファイルの集計方法を変更
@@ -507,19 +589,19 @@ def find_duplicates(
         compare_non_duplicates = [p for p in compare_list if normalize(p) in non_duplicates_norm]
         main_non_duplicates = []  # 同じフォルダなのでα側の非重複は0
         
-        # バイトサイズ計算（重複ペア数ではなく、重複ファイル数分）
+        # バイトサイズ計算（リンク化で削減できる片方分のサイズ）
         total_bytes = 0
         counted_files = set()
         for main_path, compare_path, _ in results:
-            for path in [main_path, compare_path]:
-                norm_path = normalize(path)
-                if norm_path not in counted_files:
-                    counted_files.add(norm_path)
-                    try:
-                        if os.path.exists(path):
-                            total_bytes += os.path.getsize(path)
-                    except Exception:
-                        continue
+            # 重複ペアの片方のサイズのみ計上（リンク化で削減される分）
+            norm_path = normalize(main_path)
+            if norm_path not in counted_files:
+                counted_files.add(norm_path)
+                try:
+                    if os.path.exists(main_path):
+                        total_bytes += os.path.getsize(main_path)
+                except Exception:
+                    continue
     else:
         # 異なるフォルダ比較の場合（従来の動作）
         duplicate_norms_compare = set()
@@ -546,8 +628,14 @@ def find_duplicates(
             main_nondup_container.extend(main_non_duplicates)
         tree.delete(*tree.get_children())
         for r in results:
+            # ファイルサイズを取得（α側のサイズ＝リンク化で削減される分）
+            try:
+                file_size = os.path.getsize(r[0]) if os.path.exists(r[0]) else 0
+            except Exception:
+                file_size = 0
+            size_display = format_size(file_size)
             # チェックボックス列を追加（デフォルトは未選択）
-            tree.insert('', 'end', values=('☐', r[0], r[1], r[2]))
+            tree.insert('', 'end', values=('☐', r[0], r[1], r[2], size_display, file_size))
         count_label.config(
             text=(
                 f'重複検出数: {len(results)} 件 / '
@@ -579,9 +667,13 @@ def find_duplicates(
 
     with open('duplicate_report.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
-        w.writerow(['α','β','判定内容'])
+        w.writerow(['α','β','判定内容','サイズ'])
         for r in results:
-            w.writerow(r)
+            try:
+                file_size = os.path.getsize(r[0]) if os.path.exists(r[0]) else 0
+            except Exception:
+                file_size = 0
+            w.writerow(list(r) + [format_size(file_size)])
 
 
 def _update_progress(progress_bar, value):
@@ -723,6 +815,9 @@ class App:
         self.last_selected_item = None
         self._suppress_header_toggle = False
         self._icon_set = False  # アイコン設定フラグ
+        # ソート状態
+        self._sort_size_ascending = False  # サイズソートの昇降順（Falseで初回は降順）
+        self._sort_reason_ascending = False  # 判定内容ソートの昇降順（Falseで初回は昇順）
 
     def _setup_window(self):
         self.root.title('Duplicate Link Tool')
@@ -957,6 +1052,10 @@ class App:
         self.total_size_label = tk.Label(self.root, textvariable=self.total_size_var, bg=DARK_BG, fg=DARK_FG)
         self.total_size_label.pack(padx=10)
         
+        self.selection_info_var = tk.StringVar(value='')
+        self.selection_info_label = tk.Label(self.root, textvariable=self.selection_info_var, bg=DARK_BG, fg='#f0e68c')
+        self.selection_info_label.pack(padx=10)
+        
         self.zip_status_label = tk.Label(self.root, textvariable=self.zip_status_var, bg=DARK_BG, fg=DARK_FG)
         self.zip_status_label.pack(padx=10)
 
@@ -966,15 +1065,18 @@ class App:
 
         tree_frame = tk.Frame(tree_container, bg=DARK_BG, highlightthickness=0)
         tree_frame.pack(fill='both', expand=True, padx=0, pady=0)
-        self.tree = ttk.Treeview(tree_frame, columns=('select', 'main', 'dup', 'reason'), show='headings', height=13, selectmode='browse')
+        self.tree = ttk.Treeview(tree_frame, columns=('select', 'main', 'dup', 'reason', 'size', 'size_bytes'), show='headings', height=13, selectmode='browse', displaycolumns=('select', 'main', 'dup', 'reason', 'size'))
         self.tree.heading('select', text='☐', command=lambda: self.toggle_all_selection())
         self.tree.heading('main', text='α')
         self.tree.heading('dup', text='β')
         self.tree.heading('reason', text='判定内容')
+        self.tree.heading('size', text='サイズ')
         self.tree.column('select', width=40, anchor='center', stretch=False)
-        self.tree.column('main', width=360)
-        self.tree.column('dup', width=360)
-        self.tree.column('reason', width=200)
+        self.tree.column('main', width=320)
+        self.tree.column('dup', width=320)
+        self.tree.column('reason', width=160)
+        self.tree.column('size', width=90, anchor='e')
+        self.tree.column('size_bytes', width=0, stretch=False)  # 非表示（ソート用）
         
         tree_scroll_y = ttk.Scrollbar(tree_frame, orient='vertical', command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll_y.set)
@@ -1027,6 +1129,8 @@ class App:
         
         # 最後の選択をリセット（範囲選択の開始点をクリア）
         self.last_selected_item = None
+        
+        self._update_selection_info()
     
     def on_tree_button_down(self, event):
         """マウスボタン押下時の処理（ヘッダークリックの判定用）"""
@@ -1046,6 +1150,18 @@ class App:
             # select列のヘッダークリックは全選択/全解除
             if column == '#1':
                 self.toggle_all_selection()
+            # α列（main）のヘッダークリック→フォルダ名でソート
+            elif column == '#2':
+                self._sort_by_folder('main')
+            # β列（dup）のヘッダークリック→フォルダ名でソート
+            elif column == '#3':
+                self._sort_by_folder('dup')
+            # 判定内容列のヘッダークリック→判定理由でトグルソート
+            elif column == '#4':
+                self._sort_by_reason()
+            # サイズ列のヘッダークリック→サイズでトグルソート
+            elif column == '#5':
+                self._sort_by_size()
             # その他のヘッダーは無視（下のアイテムへの伝播を防止）
             return 'break'
         
@@ -1092,6 +1208,7 @@ class App:
                 self.tree.item(item_id, values=values)
 
                 self.last_selected_item = item_id
+            self._update_selection_info()
             return 'break'
         else:
             # その他の列：ファイルを開く
@@ -1122,7 +1239,69 @@ class App:
         
         # 範囲選択後はlast_selected_itemを更新しない
         # これにより次のクリックが新しい起点として扱われる
+        self._update_selection_info()
     
+    def _update_selection_info(self):
+        """選択中のアイテム数と合計サイズを更新"""
+        selected_count = 0
+        total_bytes = 0
+        for item_id in self.tree.get_children():
+            if self.tree_selection_state.get(item_id, False):
+                selected_count += 1
+                values = self.tree.item(item_id, 'values')
+                if len(values) > 5:
+                    try:
+                        total_bytes += int(values[5])
+                    except (ValueError, TypeError):
+                        pass
+        if selected_count > 0:
+            self.selection_info_var.set(
+                f'選択中: {selected_count} 件 / 合計サイズ: {format_size(total_bytes)}'
+            )
+        else:
+            self.selection_info_var.set('')
+
+    def _sort_tree_items(self, key_func, reverse=False):
+        """Treeviewのアイテムをソートする共通処理"""
+        items = [(self.tree.item(iid, 'values'), iid) for iid in self.tree.get_children()]
+        items.sort(key=lambda x: key_func(x[0]), reverse=reverse)
+        for idx, (_, iid) in enumerate(items):
+            self.tree.move(iid, '', idx)
+    
+    def _sort_by_size(self):
+        """サイズ列でソート（タップするたびに降順⇔昇順を切替）"""
+        self._sort_tree_items(
+            key_func=lambda vals: int(vals[5]) if len(vals) > 5 and str(vals[5]).isdigit() else 0,
+            reverse=not self._sort_size_ascending,
+        )
+        arrow = ' ▲' if self._sort_size_ascending else ' ▼'
+        self.tree.heading('size', text='サイズ' + arrow)
+        # 他の列のヘッダーを元に戻す
+        self.tree.heading('reason', text='判定内容')
+        self._sort_size_ascending = not self._sort_size_ascending
+    
+    def _sort_by_reason(self):
+        """判定内容列でソート（タップするたびに切替）"""
+        self._sort_tree_items(
+            key_func=lambda vals: str(vals[3]) if len(vals) > 3 else '',
+            reverse=self._sort_reason_ascending,
+        )
+        arrow = ' ▲' if not self._sort_reason_ascending else ' ▼'
+        self.tree.heading('reason', text='判定内容' + arrow)
+        # 他の列のヘッダーを元に戻す
+        self.tree.heading('size', text='サイズ')
+        self._sort_reason_ascending = not self._sort_reason_ascending
+    
+    def _sort_by_folder(self, column: str):
+        """フォルダ名でグループ化ソート（切替なし）"""
+        col_idx = 1 if column == 'main' else 2
+        self._sort_tree_items(
+            key_func=lambda vals: os.path.dirname(str(vals[col_idx])).lower() if len(vals) > col_idx else '',
+        )
+        # ヘッダーのソート表示をリセット
+        self.tree.heading('size', text='サイズ')
+        self.tree.heading('reason', text='判定内容')
+
     def log_separator(self, title: str = ''):
         """ログに区切り線を追加"""
         if title:
@@ -1233,7 +1412,7 @@ class App:
         for item_id in self.tree.get_children():
             if self.tree_selection_state.get(item_id, False):
                 values = self.tree.item(item_id, 'values')
-                if len(values) >= 4:  # select, α, β, 判定内容
+                if len(values) >= 4:  # select, α, β, 判定内容, サイズ...
                     selected.append({
                         'item_id': item_id,
                         'main': values[1],
@@ -1353,6 +1532,10 @@ class App:
         self.tree.delete(*self.tree.get_children())
         self.tree_selection_state.clear()  # 選択状態をクリア
         self.last_selected_item = None  # 最後の選択をリセット
+        self._sort_size_ascending = False  # ソート状態をリセット
+        self._sort_reason_ascending = False
+        self.selection_info_var.set('')  # 選択情報をクリア
+        self.tree.heading('select', text='☐')  # ヘッダーチェックボックスをリセット
         self.log.delete('1.0', 'end')
         self.progress['value'] = 0
         self.cancel_flag.clear()
@@ -1371,6 +1554,8 @@ class App:
         compare_folder_name = os.path.basename(self.compare_dir.get().rstrip(os.sep))
         self.tree.heading('main', text=main_folder_name or 'α')
         self.tree.heading('dup', text=compare_folder_name or 'β')
+        self.tree.heading('reason', text='判定内容')
+        self.tree.heading('size', text='サイズ')
         
         threading.Thread(
             target=find_duplicates,
@@ -1859,7 +2044,8 @@ class App:
         created_counts: Counter[str] = Counter()
         cancelled = False
         operations: list[dict[str, Path]] = []
-        contexts: list[tuple[Path, Path, Path, Path]] = []  # (link_actual, target_for_shortcut, original_to_delete, target_path)
+        contexts: list[tuple[str, Path, Path, Path, Path]] = []  # (item_id, link_actual, target_for_shortcut, original_to_delete, target_path)
+        succeeded_items: list[str] = []  # 成功したアイテムID
 
         for item in self.tree.get_children():
             if self.cancel_flag.is_set():
@@ -1939,13 +2125,13 @@ class App:
                     pass
 
             operations.append({'link': link_actual, 'target': target_for_shortcut})
-            contexts.append((link_actual, target_for_shortcut, original_to_delete, target_path))
+            contexts.append((item, link_actual, target_for_shortcut, original_to_delete, target_path))
 
         message = ''
         batch_script = ''
         if operations and not cancelled:
             ok, message, batch_script = self._execute_shortcut_batch(operations)
-            for link_path, target_for_sc, original_del, target_abs in contexts:
+            for item_id, link_path, target_for_sc, original_del, target_abs in contexts:
                 link_str = str(link_path)
                 target_str = str(target_for_sc)
                 created = link_path.exists()
@@ -1962,6 +2148,7 @@ class App:
                 if created:
                     success += 1
                     created_counts['ショートカット'] += 1
+                    succeeded_items.append(item_id)
                     # パス形式を判定（相対パスかどうか）
                     is_relative = not Path(target_str).is_absolute() if target_str else False
                     path_type_label = ", 相対パス" if is_relative else ", 絶対パス"
@@ -1999,11 +2186,37 @@ class App:
         main_value = self.main_dir.get()
         compare_value = self.compare_dir.get()
         realize_value = self.realize_source.get()
-        self.root.after(0, lambda: self._post_linking_ui_updates(main_value, compare_value, realize_value))
+        self.root.after(0, lambda: self._post_linking_ui_updates(main_value, compare_value, realize_value, succeeded_items))
 
-    def _post_linking_ui_updates(self, main_path: str, compare_path: str, realize_path: str) -> None:
+    def _post_linking_ui_updates(self, main_path: str, compare_path: str, realize_path: str, succeeded_items: list[str] | None = None) -> None:
         self.link_btn.config(state='normal')
         self.detect_btn_frame.config(relief='raised')
+        # 成功したアイテムをTreeviewから削除
+        if succeeded_items:
+            for item_id in succeeded_items:
+                if item_id in self.tree.get_children():
+                    self.tree_selection_state.pop(item_id, None)
+                    self.tree.delete(item_id)
+            # カウントラベルを更新
+            remaining = len(self.tree.get_children())
+            self.count_label.config(
+                text=(
+                    f'重複検出数: {remaining} 件 / '
+                    f'非重複(α): {len(self.main_non_duplicates)} 件 / '
+                    f'非重複(β): {len(self.compare_non_duplicates)} 件'
+                )
+            )
+            # 重複合計サイズを再計算
+            remaining_bytes = 0
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid, 'values')
+                if len(vals) > 5:
+                    try:
+                        remaining_bytes += int(vals[5])
+                    except (ValueError, TypeError):
+                        pass
+            self.total_size_var.set(f'重複合計サイズ: {format_size(remaining_bytes)}')
+            self._update_selection_info()
         if main_path:
             self._schedule_link_summary(main_path, self.main_link_summary_var)
         if compare_path:
@@ -2042,6 +2255,19 @@ class App:
     def _linking_worker(self, link_type: str, name_mode: str, path_mode: str, keep_side: str):
         use_relative_path = (path_mode == 'relative')
         
+        try:
+            self._linking_worker_impl(link_type, name_mode, path_mode, keep_side, use_relative_path)
+        except Exception as exc:
+            self.log_message(f'[ERROR] リンク化処理中に予期しない例外が発生しました: {exc}')
+            import traceback
+            for line in traceback.format_exc().strip().splitlines():
+                self.log_message(line)
+            main_value = self.main_dir.get()
+            compare_value = self.compare_dir.get()
+            realize_value = self.realize_source.get()
+            self.root.after(0, lambda: self._post_linking_ui_updates(main_value, compare_value, realize_value, None))
+
+    def _linking_worker_impl(self, link_type: str, name_mode: str, path_mode: str, keep_side: str, use_relative_path: bool):
         if link_type == 'ショートカット':
             self._linking_shortcut_batch(name_mode, use_relative_path, keep_side)
             return
@@ -2049,6 +2275,7 @@ class App:
         success = fail = 0
         created_counts: Counter[str] = Counter()
         cancelled = False
+        succeeded_items: list[str] = []  # 成功したアイテムID
         for item in self.tree.get_children():
             if self.cancel_flag.is_set():
                 cancelled = True
@@ -2128,6 +2355,7 @@ class App:
             if ok:
                 success += 1
                 created_counts[link_type] += 1
+                succeeded_items.append(item)
                 link_display = actual_link_path if actual_link_path is not None else link_path
                 link_str = str(link_display)
                 target_str = str(target_path)
@@ -2164,7 +2392,7 @@ class App:
         main_value = self.main_dir.get()
         compare_value = self.compare_dir.get()
         realize_value = self.realize_source.get()
-        self.root.after(0, lambda: self._post_linking_ui_updates(main_value, compare_value, realize_value))
+        self.root.after(0, lambda: self._post_linking_ui_updates(main_value, compare_value, realize_value, succeeded_items))
 
     def cancel_process(self):
         self.cancel_flag.set()
