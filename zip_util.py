@@ -3,7 +3,6 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
 
 
 def ensure_dir(path: Path):
@@ -19,7 +18,7 @@ def _ps_escape(value: str) -> str:
     return value.replace("'", "''")
 
 
-def resolve_shortcut(path: Path) -> Tuple[bool, Optional[Path], Optional[str]]:
+def resolve_shortcut(path: Path) -> tuple[bool, Path | None, str | None]:
     """ショートカットのリンク先を解決する。
     
     Windowsのショートカット追跡機能を使用して、移動されたリンク先を自動的に検索・更新します。
@@ -72,12 +71,12 @@ def resolve_shortcut(path: Path) -> Tuple[bool, Optional[Path], Optional[str]]:
     return True, Path(target_text), None
 
 
-def _build_realization_plan(src_root: Path) -> Tuple[List[Tuple[Path, Path]], Set[Path], List[str]]:
-    files: List[Tuple[Path, Path]] = []
-    dirs: Set[Path] = {Path('.')}
-    warnings: List[str] = []
+def _build_realization_plan(src_root: Path) -> tuple[list[tuple[Path, Path]], set[Path], list[str]]:
+    files: list[tuple[Path, Path]] = []
+    dirs: set[Path] = {Path('.')}
+    warnings: list[str] = []
 
-    def visit(path: Path, rel_path: Path, ancestors: Set[Path]):
+    def visit(path: Path, rel_path: Path, ancestors: set[Path]):
         try:
             if path.is_dir():
                 real_dir = path.resolve()
@@ -132,7 +131,7 @@ def _build_realization_plan(src_root: Path) -> Tuple[List[Tuple[Path, Path]], Se
     return files, dirs, warnings
 
 
-def realize_directory(src_root: Path, dst_root: Path, progress_cb=None) -> Tuple[int, int, List[str]]:
+def realize_directory(src_root: Path, dst_root: Path, progress_cb=None) -> tuple[int, int, list[str]]:
     if not src_root.exists():
         raise FileNotFoundError(f'ソースが存在しません: {src_root}')
 

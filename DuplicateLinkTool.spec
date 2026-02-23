@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
-import os
 
 BASE_DIR = Path(SPECPATH)
 
@@ -46,7 +45,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    uac_admin=True,
+    uac_admin=False,
+    manifest=str(BASE_DIR / 'assets' / 'dlt_manifest.xml'),
     icon=str(icon_path),
     version=str(version_info),
 )
